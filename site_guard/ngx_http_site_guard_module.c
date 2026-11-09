@@ -29,7 +29,6 @@ typedef struct {
 
 typedef struct {
     ngx_uint_t  status;
-    ngx_flag_t  stats_recorded;
 } ngx_http_site_guard_request_ctx_t;
 
 static ngx_int_t ngx_http_site_guard_handler(ngx_http_request_t *r);
@@ -116,6 +115,8 @@ static ngx_http_variable_t ngx_http_site_guard_vars[] = {
       4, NGX_HTTP_VAR_NOCACHEABLE, 0 },
     { ngx_string("site_guard_referer_ips"), NULL, ngx_http_site_guard_variable,
       5, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_once"), NULL, NULL, 0,
+      NGX_HTTP_VAR_CHANGEABLE|NGX_HTTP_VAR_NOCACHEABLE, 0 },
       ngx_http_null_variable
 };
 
@@ -124,6 +125,9 @@ static ngx_str_t ngx_http_site_guard_status_names[] = {
     ngx_string("MATCHED_DRY_RUN"), ngx_string("DISABLED")
 };
 
+static ngx_uint_t ngx_http_site_guard_once_index = NGX_CONF_UNSET_UINT;
+static ngx_str_t ngx_http_site_guard_once_name = ngx_string("site_guard_once");
+
 static ngx_int_t
 ngx_http_site_guard_handler(ngx_http_request_t *r)
 {
@@ -131,6 +135,7 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
     ngx_str_t                        *prefix, *rule, referer;
     ngx_http_site_guard_loc_conf_t     *lrcf;
     ngx_http_site_guard_request_ctx_t  *rctx;
+    ngx_http_variable_value_t        *vv;
 
     if (r != r->main || !(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
         return NGX_DECLINED;
@@ -149,9 +154,14 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
         rctx->status = NGX_HTTP_SITE_GUARD_DISABLED;
         return NGX_DECLINED;
     }
-    if (!rctx->stats_recorded) {
+    vv = &r->variables[ngx_http_site_guard_once_index];
+    if (!vv->valid) {
         ngx_http_site_guard_stats_record(r, lrcf->shm_zone);
-        rctx->stats_recorded = 1;
+        vv->valid = 1;
+        vv->no_cacheable = 1;
+        vv->not_found = 0;
+        vv->len = 1;
+        vv->data = (u_char *) "1";
     }
     if (r->headers_in.referer == NULL) {
         return NGX_DECLINED;
@@ -636,11 +646,12 @@ ngx_http_site_guard_add_variables(ngx_conf_t *cf)
         var->get_handler = v->get_handler;
         var->data = v->data;
     }
+    ngx_http_site_guard_once_index = ngx_http_get_variable_index(cf,
+        &ngx_http_site_guard_once_name);
+    if (ngx_http_site_guard_once_index == NGX_ERROR) {
+        return NGX_ERROR;
+    }
     return NGX_OK;
-}
-
-static ngx_int_t
-ngx_http_site_guard_init(ngx_conf_t *cf)
 {
     ngx_http_handler_pt        *h;
     ngx_http_core_main_conf_t  *cmcf;
