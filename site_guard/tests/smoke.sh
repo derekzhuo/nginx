@@ -16,7 +16,7 @@ fi
 
 PREFIX="$(mktemp -d /tmp/site-guard-smoke.XXXXXX)"
 cleanup() {
-  "$NGINX_BIN" -p "$PREFIX" -s stop >/dev/null 2>&1 || true
+  "$NGINX_BIN" -p "$PREFIX" -c "$PREFIX/conf.nginx" -s stop >/dev/null 2>&1 || true
   i=0
   while pgrep -f "nginx.*-p $PREFIX" >/dev/null 2>&1 && [ "$i" -lt 30 ]; do
     i=$((i + 1)); sleep 0.1
@@ -165,7 +165,7 @@ else
 fi
 
 if [ "$fail" -ne 0 ]; then
-  "$NGINX_BIN" -p "$PREFIX" -s stop >/dev/null 2>&1 || true
+  "$NGINX_BIN" -p "$PREFIX" -c "$PREFIX/conf.nginx" -s stop >/dev/null 2>&1 || true
   pkill -f "nginx.*-p $PREFIX" >/dev/null 2>&1 || true
   echo "SMOKE FAILED; prefix kept for inspection: $PREFIX" >&2
   trap - EXIT

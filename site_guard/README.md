@@ -237,3 +237,16 @@ no sanitizer report references module code. The same harness passes against
 both the sanitizer build and a plain build configured with a separate
 `--builddir`. Sanitizer build and run options, including the known nginx core
 UBSan finding, are documented in `docs/m2.md`.
+
+A loopback latency benchmark complements the functional harness:
+
+```bash
+NGINX_BIN=$PWD/objs-normal/nginx sh site_guard/tests/bench.sh
+```
+
+It sweeps concurrency 1/4/16 with 20,000 keep-alive requests per run across
+guard-off, no-Referer, 64-rule full-scan, and excluded-prefix scenarios,
+reporting achieved rps with mean/P95/P99 latency. `ab` percentiles have
+1-millisecond resolution on macOS, so sub-millisecond overhead is read from
+the mean; the measured full-scan overhead is about 0.03 ms at c=16 with the
+P95/P99 NFR (1 ms / 3 ms) met at that resolution.
