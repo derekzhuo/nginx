@@ -245,8 +245,17 @@ ngx_http_site_guard_add_value(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t
 ngx_http_site_guard_add_variables(ngx_conf_t *cf)
 {
-    return ngx_http_add_variables(cf, ngx_http_site_guard_vars,
-                                  NGX_HTTP_VAR_CHANGEABLE);
+    ngx_http_variable_t  *var, *v;
+
+    for (v = ngx_http_site_guard_vars; v->name.len; v++) {
+        var = ngx_http_add_variable(cf, &v->name, v->flags);
+        if (var == NULL) {
+            return NGX_ERROR;
+        }
+        var->get_handler = v->get_handler;
+        var->data = v->data;
+    }
+    return NGX_OK;
 }
 
 static ngx_int_t
