@@ -131,12 +131,30 @@ ngx_http_site_guard_stats_hll(ngx_http_site_guard_stat_node_t *sn,
 }
 
 static void
+ngx_http_site_guard_stats_evict_locked(ngx_http_site_guard_zone_ctx_t *zctx)
+{
+    ngx_queue_t                      *q;
+    ngx_rbtree_node_t                *node;
+    ngx_http_site_guard_stat_node_t  *sn;
+
+    if (zctx->sh->nodes == 0) {
+        return;
+    }
+    q = ngx_queue_last(&zctx->sh->queue);
+    sn = ngx_queue_data(q, ngx_http_site_guard_stat_node_t, queue);
+    node = (ngx_rbtree_node_t *) &sn->color;
+    ngx_rbtree_delete(&zctx->sh->rbtree, node);
+    ngx_queue_remove(q);
+    ngx_slab_free_locked(zctx->shpool, node);
+    zctx->sh->nodes--;
+}
+
+static void
 ngx_http_site_guard_stats_update_locked(ngx_http_site_guard_zone_ctx_t *zctx,
     ngx_uint_t type, ngx_str_t *key, ngx_http_request_t *r, ngx_msec_t now)
 {
     size_t                            size, slot;
     ngx_uint_t                        hash;
-    ngx_queue_t                      *q;
     ngx_rbtree_node_t                *node;
     ngx_http_site_guard_stat_node_t  *sn;
 
@@ -145,15 +163,12 @@ ngx_http_site_guard_stats_update_locked(ngx_http_site_guard_zone_ctx_t *zctx,
 
     if (sn == NULL) {
         size = offsetof(ngx_http_site_guard_stat_node_t, data) + key->len;
+        if (zctx->sh->nodes >= NGX_HTTP_SITE_GUARD_STATS_MAX_NODES) {
+            ngx_http_site_guard_stats_evict_locked(zctx);
+        }
         node = ngx_slab_alloc_locked(zctx->shpool, size);
         if (node == NULL && zctx->sh->nodes != 0) {
-            q = ngx_queue_last(&zctx->sh->queue);
-            sn = ngx_queue_data(q, ngx_http_site_guard_stat_node_t, queue);
-            node = (ngx_rbtree_node_t *) &sn->color;
-            ngx_rbtree_delete(&zctx->sh->rbtree, node);
-            ngx_queue_remove(q);
-            ngx_slab_free_locked(zctx->shpool, node);
-            zctx->sh->nodes--;
+            ngx_http_site_guard_stats_evict_locked(zctx);
             node = ngx_slab_alloc_locked(zctx->shpool, size);
         }
         if (node == NULL) {
