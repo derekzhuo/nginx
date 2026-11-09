@@ -36,7 +36,7 @@ runtime-rule generation, or zero when no shared zone is configured.
 Configure a shared zone and a local rule file:
 
 ```nginx
-site_guard_zone site_guard=1m;
+site_guard_zone site_guard 1m;
 site_guard_rules_file /data/site-guard/referers.rules;
 ```
 
