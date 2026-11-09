@@ -36,7 +36,7 @@ Use the same Nginx release as the target runtime. Do not load a module built
 from another release into a production binary.
 
 ```bash
-./configure \
+auto/configure \
   --prefix=/tmp/site-guard-build \
   --add-module=./site_guard
 make -j1
