@@ -144,3 +144,19 @@ curl -i -e https://example.com/other \
 
 Production installation, configuration changes, and process replacement are
 outside this module's build and smoke-test procedure.
+
+## Automated test harness
+
+`tests/smoke.sh` performs the above checks automatically against any
+already-built binary, using an isolated temporary prefix that is removed on
+exit:
+
+```bash
+NGINX_BIN=$PWD/objs/nginx sh site_guard/tests/smoke.sh
+```
+
+It asserts the excluded path, static and runtime Referer rules, pass-through
+cases, spoof-host and trailing-slash handling, HEAD parity, and the statistics
+variables, then verifies that no sanitizer report references module code.
+Sanitizer build and run options, including the known nginx core UBSan finding,
+are documented in `docs/m2.md`.
