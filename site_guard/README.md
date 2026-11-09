@@ -3,9 +3,9 @@
 `ngx_http_site_guard_module` is an access-phase HTTP module for exact
 Referer policies on static sites. It does not modify the Nginx core.
 
-This is the M1 implementation: configuration-driven matching, shadow mode,
-enforce mode, a logging variable, and shared-memory runtime rules. Shared-memory
-behavior aggregation is intentionally left for a later milestone.
+This is the M2 implementation: configuration-driven matching, shadow mode,
+enforce mode, shared-memory runtime rules, and bounded behavior statistics.
+Automatic enforcement from statistical signals is intentionally disabled.
 
 ## Directives
 
@@ -60,6 +60,33 @@ independently.
 
 No Nginx reload is required. Runtime files must be local, and their parent
 directory must be writable only by trusted operators.
+
+## Behavior statistics
+
+A configured shared zone also aggregates enabled main requests by complete
+Referer, User-Agent, and the first URI path segment. Referer and User-Agent keys
+are capped at 255 bytes. Statistics use at most 256 nodes with least-recently-used
+eviction and linear lookup. This deliberately simple index is suitable for M2
+validation; it needs a performance review before increasing the capacity.
+
+Thirty 10-second buckets retain request counts for approximately five minutes.
+The `*_qpm` variables sum buckets from the latest 60 seconds. Approximate unique
+IPs use 64-register HyperLogLog with a small-range linear-count correction over
+a five-minute tumbling window.
+
+```nginx
+log_format guard "$pid $status $site_guard_referer_qpm "
+                 "$site_guard_ua_qpm $site_guard_path_qpm "
+                 "$site_guard_referer_ips";
+```
+
+- `site_guard_referer_qpm`: requests for the current Referer;
+- `site_guard_ua_qpm`: requests for the current User-Agent;
+- `site_guard_path_qpm`: requests for the current first path segment;
+- `site_guard_referer_ips`: approximate distinct client IPs for the Referer.
+
+Missing dimensions report zero. Statistics are observability signals only: they
+must not be interpreted as proof that an individual request is malicious.
 
 ## Isolated build
 
