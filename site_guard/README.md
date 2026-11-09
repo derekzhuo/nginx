@@ -186,6 +186,38 @@ curl -i -e https://example.com/other \
 Production installation, configuration changes, and process replacement are
 outside this module's build and smoke-test procedure.
 
+## Offline log analysis
+
+Two tools under `site_guard/tools/` work on sanitized nginx combined logs
+without sending any traffic. They share an awk reimplementation of the
+module's normalization (`sg-normalize.awk`), so offline verdicts match
+runtime matching semantics.
+
+```bash
+# Ranked candidate rules with hit, distinct-IP, cluster, and host counts.
+site_guard/tools/candidate-rules.sh --min-hits 20 wave1.log wave2.log
+
+# Emit at most 64 canonical rules, ready for the control plane.
+site_guard/tools/candidate-rules.sh --rules wave.log \
+  | xargs site_guard/tests/site-guard-ctl /data/site-guard/referers.rules add
+
+# Replay a rule set across two waves; -x mirrors site_guard_excluded_prefix.
+site_guard/tools/replay-rules.sh -x /nn/ rules.txt wave1.log wave2.log
+```
+
+The replay report classifies each request as would-block or pass, gives the
+block ratio and pass reasons, ranks blocked Referers, and counts
+same-cluster blocks as a false-positive indicator for human review. A
+synthetic-log suite covers both tools:
+
+```bash
+sh site_guard/tests/offline-tools-test.sh
+```
+
+Raw production logs must be sanitized before they leave the origin; the
+tools themselves parse only the request, status, Referer, and User-Agent
+fields.
+
 ## Automated test harness
 
 `tests/smoke.sh` performs the above checks automatically against any
