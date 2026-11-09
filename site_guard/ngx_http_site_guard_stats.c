@@ -27,82 +27,29 @@ ngx_http_site_guard_hash64(u_char *data, size_t len)
     return hash;
 }
 
-static void
-ngx_http_site_guard_stats_rbtree_insert(ngx_rbtree_node_t *temp,
-    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
-{
-    ngx_rbtree_node_t               **p;
-    ngx_http_site_guard_stat_node_t  *sn, *snt;
-
-    for (;;) {
-        if (node->key < temp->key) {
-            p = &temp->left;
-        } else if (node->key > temp->key) {
-            p = &temp->right;
-        } else {
-            sn = (ngx_http_site_guard_stat_node_t *) &node->color;
-            snt = (ngx_http_site_guard_stat_node_t *) &temp->color;
-            if (sn->type != snt->type) {
-                p = sn->type < snt->type ? &temp->left : &temp->right;
-            } else {
-                p = ngx_memn2cmp(sn->data, snt->data, sn->len, snt->len) < 0
-                    ? &temp->left : &temp->right;
-            }
-        }
-        if (*p == sentinel) {
-            break;
-        }
-        temp = *p;
-    }
-    *p = node;
-    node->parent = temp;
-    node->left = sentinel;
-    node->right = sentinel;
-    ngx_rbt_red(node);
-}
-
 void
 ngx_http_site_guard_stats_init(ngx_http_site_guard_shctx_t *sh)
 {
-    ngx_rbtree_init(&sh->rbtree, &sh->sentinel,
-                    ngx_http_site_guard_stats_rbtree_insert);
     ngx_queue_init(&sh->queue);
 }
 
 static ngx_http_site_guard_stat_node_t *
 ngx_http_site_guard_stats_lookup_locked(ngx_http_site_guard_shctx_t *sh,
-    ngx_uint_t hash, ngx_uint_t type, ngx_str_t *key)
+    ngx_uint_t type, ngx_str_t *key)
 {
-    ngx_rbtree_node_t               *node, *sentinel;
+    ngx_queue_t                      *q;
     ngx_http_site_guard_stat_node_t  *sn;
 
-    node = sh->rbtree.root;
-    sentinel = &sh->sentinel;
-    while (node != sentinel) {
-        sn = (ngx_http_site_guard_stat_node_t *) &node->color;
-        if (hash < node->key) {
-            node = node->left;
-            continue;
-        }
-        if (hash > node->key) {
-            node = node->right;
-            continue;
-        }
-        if (type < sn->type) {
-            node = node->left;
-            continue;
-        }
-        if (type > sn->type) {
-            node = node->right;
-            continue;
-        }
-        if (sn->len == key->len
+    for (q = ngx_queue_head(&sh->queue);
+         q != &sh->queue;
+         q = ngx_queue_next(q))
+    {
+        sn = ngx_queue_data(q, ngx_http_site_guard_stat_node_t, queue);
+        if (sn->type == type && sn->len == key->len
             && ngx_strncmp(sn->data, key->data, key->len) == 0)
         {
             return sn;
         }
-        node = ngx_memn2cmp(key->data, sn->data, key->len, sn->len) < 0
-               ? node->left : node->right;
     }
     return NULL;
 }
@@ -134,7 +81,6 @@ static void
 ngx_http_site_guard_stats_evict_locked(ngx_http_site_guard_zone_ctx_t *zctx)
 {
     ngx_queue_t                      *q;
-    ngx_rbtree_node_t                *node;
     ngx_http_site_guard_stat_node_t  *sn;
 
     if (zctx->sh->nodes == 0) {
@@ -142,10 +88,8 @@ ngx_http_site_guard_stats_evict_locked(ngx_http_site_guard_zone_ctx_t *zctx)
     }
     q = ngx_queue_last(&zctx->sh->queue);
     sn = ngx_queue_data(q, ngx_http_site_guard_stat_node_t, queue);
-    node = (ngx_rbtree_node_t *) &sn->color;
-    ngx_rbtree_delete(&zctx->sh->rbtree, node);
     ngx_queue_remove(q);
-    ngx_slab_free_locked(zctx->shpool, node);
+    ngx_slab_free_locked(zctx->shpool, sn);
     zctx->sh->nodes--;
 }
 
@@ -154,35 +98,29 @@ ngx_http_site_guard_stats_update_locked(ngx_http_site_guard_zone_ctx_t *zctx,
     ngx_uint_t type, ngx_str_t *key, ngx_http_request_t *r, ngx_msec_t now)
 {
     size_t                            size, slot;
-    ngx_uint_t                        hash;
-    ngx_rbtree_node_t                *node;
     ngx_http_site_guard_stat_node_t  *sn;
 
-    hash = (ngx_uint_t) ngx_crc32_short(key->data, key->len) ^ type;
-    sn = ngx_http_site_guard_stats_lookup_locked(zctx->sh, hash, type, key);
+    sn = ngx_http_site_guard_stats_lookup_locked(zctx->sh, type, key);
 
     if (sn == NULL) {
         size = offsetof(ngx_http_site_guard_stat_node_t, data) + key->len;
         if (zctx->sh->nodes >= NGX_HTTP_SITE_GUARD_STATS_MAX_NODES) {
             ngx_http_site_guard_stats_evict_locked(zctx);
         }
-        node = ngx_slab_alloc_locked(zctx->shpool, size);
-        if (node == NULL && zctx->sh->nodes != 0) {
+        sn = ngx_slab_alloc_locked(zctx->shpool, size);
+        if (sn == NULL && zctx->sh->nodes != 0) {
             ngx_http_site_guard_stats_evict_locked(zctx);
-            node = ngx_slab_alloc_locked(zctx->shpool, size);
+            sn = ngx_slab_alloc_locked(zctx->shpool, size);
         }
-        if (node == NULL) {
+        if (sn == NULL) {
             return;
         }
-        sn = (ngx_http_site_guard_stat_node_t *) &node->color;
         ngx_memzero(sn, size);
         sn->type = (u_char) type;
         sn->len = (u_short) key->len;
         sn->hll_start = now;
         ngx_queue_init(&sn->queue);
         ngx_memcpy(sn->data, key->data, key->len);
-        node->key = hash;
-        ngx_rbtree_insert(&zctx->sh->rbtree, node);
         zctx->sh->nodes++;
     }
 
@@ -285,7 +223,7 @@ ngx_http_site_guard_stats_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data, ngx_shm_zone_t *shm_zone)
 {
     double                            estimate, sum;
-    ngx_uint_t                        hash, i, type, value, zeros;
+    ngx_uint_t                        i, type, value, zeros;
     ngx_str_t                         key;
     ngx_msec_t                        now;
     ngx_http_site_guard_zone_ctx_t  *zctx;
@@ -305,10 +243,9 @@ ngx_http_site_guard_stats_variable(ngx_http_request_t *r,
 
     zctx = shm_zone->data;
     now = ngx_current_msec;
-    hash = (ngx_uint_t) ngx_crc32_short(key.data, key.len) ^ type;
 
     ngx_shmtx_lock(&zctx->shpool->mutex);
-    sn = ngx_http_site_guard_stats_lookup_locked(zctx->sh, hash, type, &key);
+    sn = ngx_http_site_guard_stats_lookup_locked(zctx->sh, type, &key);
     if (sn != NULL && data == 5) {
         if ((ngx_msec_int_t) (now - sn->hll_start) < 300000) {
             sum = 0;

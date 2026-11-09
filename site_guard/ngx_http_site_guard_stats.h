@@ -22,7 +22,6 @@ typedef struct {
 } ngx_http_site_guard_bucket_t;
 
 typedef struct {
-    u_char                         color;
     u_char                         type;
     u_short                        len;
     ngx_queue_t                    queue;
@@ -33,8 +32,6 @@ typedef struct {
 } ngx_http_site_guard_stat_node_t;
 
 typedef struct {
-    ngx_rbtree_t                   rbtree;
-    ngx_rbtree_node_t              sentinel;
     ngx_queue_t                    queue;
     ngx_uint_t                     nodes;
     ngx_uint_t                     generation;
