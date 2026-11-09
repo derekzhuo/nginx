@@ -648,10 +648,14 @@ ngx_http_site_guard_add_variables(ngx_conf_t *cf)
     }
     ngx_http_site_guard_once_index = ngx_http_get_variable_index(cf,
         &ngx_http_site_guard_once_name);
-    if (ngx_http_site_guard_once_index == NGX_ERROR) {
+    if (ngx_http_site_guard_once_index == (ngx_uint_t) NGX_ERROR) {
         return NGX_ERROR;
     }
     return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_site_guard_init(ngx_conf_t *cf)
 {
     ngx_http_handler_pt        *h;
     ngx_http_core_main_conf_t  *cmcf;
