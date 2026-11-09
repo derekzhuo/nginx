@@ -3,9 +3,9 @@
 `ngx_http_site_guard_module` is an access-phase HTTP module for exact
 Referer policies on static sites. It does not modify the Nginx core.
 
-This is the M0 implementation: configuration-driven matching, shadow mode,
-enforce mode, and a logging variable. Runtime rule updates and shared-memory
-behavior aggregation are intentionally left for later milestones.
+This is the M1 implementation: configuration-driven matching, shadow mode,
+enforce mode, a logging variable, and shared-memory runtime rules. Shared-memory
+behavior aggregation is intentionally left for a later milestone.
 
 ## Directives
 
@@ -28,7 +28,38 @@ site_guard_excluded_prefix /source/;
   on a high-volume production rule without evaluating log volume.
 
 The `$site_guard_status` variable is `PASSED`, `MATCHED`,
-`MATCHED_DRY_RUN`, or `DISABLED`.
+`MATCHED_DRY_RUN`, or `DISABLED`. `$site_guard_generation` reports the current
+runtime-rule generation, or zero when no shared zone is configured.
+
+## Runtime rules
+
+Configure a shared zone and a local rule file:
+
+```nginx
+site_guard_zone site_guard=1m;
+site_guard_rules_file /data/site-guard/referers.rules;
+```
+
+The file contains one complete Referer per line. Blank lines and lines beginning
+with `#` are ignored. M1 accepts at most 64 rules, 2048 bytes per rule, and
+131072 bytes per file.
+
+Replace the file atomically so its inode changes:
+
+```bash
+cp referers.rules /data/site-guard/referers.rules.tmp
+# Edit referers.rules.tmp, then publish it in one operation.
+mv /data/site-guard/referers.rules.tmp /data/site-guard/referers.rules
+```
+
+One worker checks the file at most once per second. A changed file is parsed
+completely before the shared generation is replaced. Workers keep using the
+previous generation if reading, parsing, or allocation fails. An empty valid
+file clears runtime rules. Static `site_guard_referer` directives remain active
+independently.
+
+No Nginx reload is required. Runtime files must be local, and their parent
+directory must be writable only by trusted operators.
 
 ## Isolated build
 

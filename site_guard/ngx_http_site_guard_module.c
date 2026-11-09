@@ -12,6 +12,31 @@
 #define NGX_HTTP_SITE_GUARD_DISABLED 3
 #define NGX_HTTP_SITE_GUARD_SHADOW   0
 #define NGX_HTTP_SITE_GUARD_ENFORCE  1
+#define NGX_HTTP_SITE_GUARD_MAX_RULES 64
+#define NGX_HTTP_SITE_GUARD_MAX_RULE_LEN 2048
+#define NGX_HTTP_SITE_GUARD_MAX_FILE 131072
+#define NGX_HTTP_SITE_GUARD_REFRESH 1000
+
+typedef struct {
+    size_t      len;
+    u_char     *data;
+} ngx_http_site_guard_shrule_t;
+
+typedef struct {
+    ngx_uint_t                     generation;
+    ngx_uint_t                     count;
+    ngx_uint_t                     loading;
+    ngx_msec_t                     last_check;
+    time_t                         mtime;
+    off_t                          size;
+    ngx_file_uniq_t                uniq;
+    ngx_http_site_guard_shrule_t   rules[NGX_HTTP_SITE_GUARD_MAX_RULES];
+} ngx_http_site_guard_shctx_t;
+
+typedef struct {
+    ngx_slab_pool_t                *shpool;
+    ngx_http_site_guard_shctx_t    *sh;
+} ngx_http_site_guard_zone_ctx_t;
 
 typedef struct {
     ngx_flag_t    enabled;
@@ -19,6 +44,8 @@ typedef struct {
     ngx_uint_t    status;
     ngx_array_t  *referers;
     ngx_array_t  *excluded_prefixes;
+    ngx_str_t     rules_file;
+    ngx_shm_zone_t *shm_zone;
 } ngx_http_site_guard_loc_conf_t;
 
 static ngx_int_t ngx_http_site_guard_handler(ngx_http_request_t *r);
@@ -31,6 +58,14 @@ static char *ngx_http_site_guard_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static char *ngx_http_site_guard_add_value(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_site_guard_zone(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static ngx_int_t ngx_http_site_guard_init_zone(ngx_shm_zone_t *shm_zone,
+    void *data);
+static ngx_int_t ngx_http_site_guard_refresh(ngx_http_request_t *r,
+    ngx_http_site_guard_loc_conf_t *lrcf);
+static ngx_uint_t ngx_http_site_guard_match(ngx_str_t *rule,
+    ngx_str_t *referer);
 
 static ngx_conf_enum_t ngx_http_site_guard_modes[] = {
     { ngx_string("shadow"), NGX_HTTP_SITE_GUARD_SHADOW },
@@ -52,6 +87,13 @@ static ngx_command_t ngx_http_site_guard_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_num_slot, NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_site_guard_loc_conf_t, status), NULL },
+    { ngx_string("site_guard_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+      ngx_http_site_guard_zone, NGX_HTTP_LOC_CONF_OFFSET, 0, NULL },
+    { ngx_string("site_guard_rules_file"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot, NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_site_guard_loc_conf_t, rules_file), NULL },
     { ngx_string("site_guard_referer"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
       ngx_http_site_guard_add_value, NGX_HTTP_LOC_CONF_OFFSET,
@@ -80,6 +122,8 @@ ngx_module_t ngx_http_site_guard_module = {
 static ngx_http_variable_t ngx_http_site_guard_vars[] = {
     { ngx_string("site_guard_status"), NULL, ngx_http_site_guard_variable,
       0, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_generation"), NULL, ngx_http_site_guard_variable,
+      1, NGX_HTTP_VAR_NOCACHEABLE, 0 },
       ngx_http_null_variable
 };
 
@@ -106,7 +150,7 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
     }
     ngx_http_set_ctx(r, (void *) NGX_HTTP_SITE_GUARD_PASSED,
                      ngx_http_site_guard_module);
-    if (r->headers_in.referer == NULL || lrcf->referers == NULL) {
+    if (r->headers_in.referer == NULL) {
         return NGX_DECLINED;
     }
 
@@ -121,39 +165,78 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
         }
     }
     referer = r->headers_in.referer->value;
-    rule = lrcf->referers->elts;
 
-    for (i = 0; i < lrcf->referers->nelts; i++) {
-        size_t  rule_len, referer_len;
+    if (lrcf->shm_zone != NULL && lrcf->rules_file.len != 0) {
+        ngx_http_site_guard_zone_ctx_t  *zctx;
+        ngx_uint_t                       matched;
 
-        rule_len = rule[i].len;
-        referer_len = referer.len;
-        if (rule_len > 1 && rule[i].data[rule_len - 1] == '/') {
-            rule_len--;
-        }
-        if (referer_len > 1 && referer.data[referer_len - 1] == '/') {
-            referer_len--;
-        }
-        if (rule_len == referer_len
-            && ngx_strncmp(rule[i].data, referer.data, rule_len) == 0)
-        {
-            ngx_http_set_ctx(r,
-                             lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
-                             ? (void *) NGX_HTTP_SITE_GUARD_MATCHED
-                             : (void *) NGX_HTTP_SITE_GUARD_DRY_RUN,
-                             ngx_http_site_guard_module);
-            ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
-                          "site_guard matched uri=\"%V\" referer=\"%V\"%s",
-                          &r->uri, &referer,
-                          lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
-                          ? "" : ", dry run");
-            if (lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE) {
-                return lrcf->status;
+        (void) ngx_http_site_guard_refresh(r, lrcf);
+        zctx = lrcf->shm_zone->data;
+        matched = 0;
+
+        ngx_shmtx_lock(&zctx->shpool->mutex);
+        for (i = 0; i < zctx->sh->count; i++) {
+            ngx_str_t  rule;
+
+            rule.len = zctx->sh->rules[i].len;
+            rule.data = zctx->sh->rules[i].data;
+            if (ngx_http_site_guard_match(&rule, &referer)) {
+                matched = 1;
+                break;
             }
-            return NGX_DECLINED;
+        }
+        ngx_shmtx_unlock(&zctx->shpool->mutex);
+
+        if (matched) {
+            goto matched;
         }
     }
+
+    if (lrcf->referers != NULL) {
+        rule = lrcf->referers->elts;
+        for (i = 0; i < lrcf->referers->nelts; i++) {
+            if (ngx_http_site_guard_match(&rule[i], &referer)) {
+                goto matched;
+            }
+        }
+    }
+
     return NGX_DECLINED;
+
+matched:
+
+    ngx_http_set_ctx(r,
+                     lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
+                     ? (void *) NGX_HTTP_SITE_GUARD_MATCHED
+                     : (void *) NGX_HTTP_SITE_GUARD_DRY_RUN,
+                     ngx_http_site_guard_module);
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "site_guard matched uri=\"%V\" referer=\"%V\"%s",
+                  &r->uri, &referer,
+                  lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
+                  ? "" : ", dry run");
+    if (lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE) {
+        return lrcf->status;
+    }
+    return NGX_DECLINED;
+}
+
+static ngx_uint_t
+ngx_http_site_guard_match(ngx_str_t *rule, ngx_str_t *referer)
+{
+    size_t  rule_len, referer_len;
+
+    rule_len = rule->len;
+    referer_len = referer->len;
+    if (rule_len > 1 && rule->data[rule_len - 1] == '/') {
+        rule_len--;
+    }
+    if (referer_len > 1 && referer->data[referer_len - 1] == '/') {
+        referer_len--;
+    }
+
+    return rule_len == referer_len
+           && ngx_strncmp(rule->data, referer->data, rule_len) == 0;
 }
 
 static ngx_int_t
@@ -161,6 +244,31 @@ ngx_http_site_guard_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     uintptr_t  status;
+
+    if (data == 1) {
+        ngx_uint_t                       generation;
+        ngx_http_site_guard_loc_conf_t  *lrcf;
+        ngx_http_site_guard_zone_ctx_t  *zctx;
+
+        generation = 0;
+        lrcf = ngx_http_get_module_loc_conf(r, ngx_http_site_guard_module);
+        if (lrcf->shm_zone != NULL) {
+            zctx = lrcf->shm_zone->data;
+            ngx_shmtx_lock(&zctx->shpool->mutex);
+            generation = zctx->sh->generation;
+            ngx_shmtx_unlock(&zctx->shpool->mutex);
+        }
+
+        v->data = ngx_pnalloc(r->pool, NGX_UINT_T_LEN);
+        if (v->data == NULL) {
+            return NGX_ERROR;
+        }
+        v->len = ngx_sprintf(v->data, "%ui", generation) - v->data;
+        v->valid = 1;
+        v->no_cacheable = 1;
+        v->not_found = 0;
+        return NGX_OK;
+    }
 
     status = (uintptr_t) ngx_http_get_module_ctx(r->main,
                                                  ngx_http_site_guard_module);
@@ -211,6 +319,15 @@ ngx_http_site_guard_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     if (conf->excluded_prefixes == NULL) {
         conf->excluded_prefixes = prev->excluded_prefixes;
     }
+    ngx_conf_merge_str_value(conf->rules_file, prev->rules_file, "");
+    if (conf->shm_zone == NULL) {
+        conf->shm_zone = prev->shm_zone;
+    }
+    if (conf->rules_file.len != 0 && conf->shm_zone == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "site_guard_rules_file requires site_guard_zone");
+        return NGX_CONF_ERROR;
+    }
     return NGX_CONF_OK;
 }
 
@@ -240,6 +357,257 @@ ngx_http_site_guard_add_value(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
     *item = value[1];
     return NGX_CONF_OK;
+}
+
+static ngx_int_t
+ngx_http_site_guard_refresh(ngx_http_request_t *r,
+    ngx_http_site_guard_loc_conf_t *lrcf)
+{
+    off_t                             file_size;
+    time_t                            mtime;
+    size_t                            size;
+    ssize_t                           n;
+    ngx_err_t                         err;
+    ngx_file_t                        file;
+    ngx_file_info_t                   fi;
+    ngx_file_uniq_t                   uniq;
+    ngx_msec_t                        now;
+    ngx_uint_t                        count, i, j;
+    u_char                           *base, *p, *end, *line, *start, *stop;
+    u_char                           *allocated[NGX_HTTP_SITE_GUARD_MAX_RULES];
+    ngx_http_site_guard_shrule_t      parsed[NGX_HTTP_SITE_GUARD_MAX_RULES];
+    ngx_http_site_guard_zone_ctx_t   *zctx;
+
+    zctx = lrcf->shm_zone->data;
+    now = ngx_current_msec;
+
+    ngx_shmtx_lock(&zctx->shpool->mutex);
+    if (zctx->sh->last_check != 0
+        && (ngx_msec_int_t) (now - zctx->sh->last_check)
+           < NGX_HTTP_SITE_GUARD_REFRESH)
+    {
+        ngx_shmtx_unlock(&zctx->shpool->mutex);
+        return NGX_OK;
+    }
+    zctx->sh->last_check = now;
+    if (zctx->sh->loading) {
+        ngx_shmtx_unlock(&zctx->shpool->mutex);
+        return NGX_OK;
+    }
+    ngx_shmtx_unlock(&zctx->shpool->mutex);
+
+    if (ngx_file_info(lrcf->rules_file.data, &fi) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, ngx_errno,
+                      "site_guard cannot stat rules \"%V\"", &lrcf->rules_file);
+        return NGX_ERROR;
+    }
+
+    mtime = ngx_file_mtime(&fi);
+    file_size = ngx_file_size(&fi);
+    uniq = ngx_file_uniq(&fi);
+
+    ngx_shmtx_lock(&zctx->shpool->mutex);
+    if (zctx->sh->loading) {
+        ngx_shmtx_unlock(&zctx->shpool->mutex);
+        return NGX_OK;
+    }
+    if (zctx->sh->generation != 0
+        && zctx->sh->mtime == mtime && zctx->sh->size == file_size
+        && zctx->sh->uniq == uniq)
+    {
+        ngx_shmtx_unlock(&zctx->shpool->mutex);
+        return NGX_OK;
+    }
+    zctx->sh->loading = 1;
+    ngx_shmtx_unlock(&zctx->shpool->mutex);
+
+    if (file_size < 0 || file_size > NGX_HTTP_SITE_GUARD_MAX_FILE) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "site_guard rules \"%V\" exceed size limit",
+                      &lrcf->rules_file);
+        goto failed;
+    }
+
+    size = (size_t) file_size;
+    base = ngx_palloc(r->pool, size == 0 ? 1 : size);
+    if (base == NULL) {
+        goto failed;
+    }
+
+    ngx_memzero(&file, sizeof(file));
+    file.name = lrcf->rules_file;
+    file.log = r->connection->log;
+    file.fd = ngx_open_file(lrcf->rules_file.data, NGX_FILE_RDONLY,
+                            NGX_FILE_OPEN, 0);
+    if (file.fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, ngx_errno,
+                      "site_guard cannot open rules \"%V\"", &lrcf->rules_file);
+        goto failed;
+    }
+
+    n = ngx_read_file(&file, base, size, 0);
+    err = ngx_errno;
+    if (ngx_close_file(file.fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, ngx_errno,
+                      "site_guard cannot close rules \"%V\"", &lrcf->rules_file);
+    }
+    if (n == NGX_ERROR || n != (ssize_t) size) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, err,
+                      "site_guard cannot read rules \"%V\"", &lrcf->rules_file);
+        goto failed;
+    }
+
+    count = 0;
+    p = base;
+    end = base + size;
+
+    while (p < end) {
+        line = p;
+        while (p < end && *p != '\n') {
+            p++;
+        }
+        start = line;
+        stop = p;
+        if (p < end) {
+            p++;
+        }
+        while (start < stop && (*start == ' ' || *start == '\t')) {
+            start++;
+        }
+        while (stop > start
+               && (stop[-1] == '\r' || stop[-1] == ' ' || stop[-1] == '\t'))
+        {
+            stop--;
+        }
+        if (start == stop || *start == '#') {
+            continue;
+        }
+        if ((size_t) (stop - start) > NGX_HTTP_SITE_GUARD_MAX_RULE_LEN
+            || count >= NGX_HTTP_SITE_GUARD_MAX_RULES)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "site_guard rules \"%V\" exceed rule limits",
+                          &lrcf->rules_file);
+            goto failed;
+        }
+        parsed[count].data = start;
+        parsed[count].len = stop - start;
+        count++;
+    }
+
+    ngx_shmtx_lock(&zctx->shpool->mutex);
+    for (i = 0; i < count; i++) {
+        allocated[i] = ngx_slab_alloc_locked(zctx->shpool, parsed[i].len);
+        if (allocated[i] == NULL) {
+            for (j = 0; j < i; j++) {
+                ngx_slab_free_locked(zctx->shpool, allocated[j]);
+            }
+            ngx_shmtx_unlock(&zctx->shpool->mutex);
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "site_guard zone is full while loading \"%V\"",
+                          &lrcf->rules_file);
+            goto failed;
+        }
+        ngx_memcpy(allocated[i], parsed[i].data, parsed[i].len);
+    }
+
+    for (i = 0; i < zctx->sh->count; i++) {
+        ngx_slab_free_locked(zctx->shpool, zctx->sh->rules[i].data);
+    }
+    for (i = 0; i < count; i++) {
+        zctx->sh->rules[i].data = allocated[i];
+        zctx->sh->rules[i].len = parsed[i].len;
+    }
+    zctx->sh->count = count;
+    zctx->sh->generation++;
+    zctx->sh->mtime = mtime;
+    zctx->sh->size = file_size;
+    zctx->sh->uniq = uniq;
+    zctx->sh->loading = 0;
+    j = zctx->sh->generation;
+    ngx_shmtx_unlock(&zctx->shpool->mutex);
+
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
+                  "site_guard loaded %ui rules, generation %ui", count, j);
+    return NGX_OK;
+
+failed:
+
+    ngx_shmtx_lock(&zctx->shpool->mutex);
+    zctx->sh->mtime = mtime;
+    zctx->sh->size = file_size;
+    zctx->sh->uniq = uniq;
+    zctx->sh->loading = 0;
+    ngx_shmtx_unlock(&zctx->shpool->mutex);
+    return NGX_ERROR;
+}
+
+static char *
+ngx_http_site_guard_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
+    ngx_http_site_guard_loc_conf_t  *lrcf = conf;
+    ssize_t                          size;
+    ngx_str_t                       *value;
+    ngx_http_site_guard_zone_ctx_t  *ctx;
+
+    if (lrcf->shm_zone != NULL) {
+        return "is duplicate";
+    }
+
+    value = cf->args->elts;
+    size = ngx_parse_size(&value[2]);
+    if (size == NGX_ERROR || size < 65536) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "site_guard_zone size must be at least 64k");
+        return NGX_CONF_ERROR;
+    }
+
+    ctx = ngx_pcalloc(cf->pool, sizeof(ngx_http_site_guard_zone_ctx_t));
+    if (ctx == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    lrcf->shm_zone = ngx_shared_memory_add(cf, &value[1], size,
+                                           &ngx_http_site_guard_module);
+    if (lrcf->shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+    if (lrcf->shm_zone->data != NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "site_guard_zone \"%V\" is already bound", &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    lrcf->shm_zone->init = ngx_http_site_guard_init_zone;
+    lrcf->shm_zone->data = ctx;
+    return NGX_CONF_OK;
+}
+
+static ngx_int_t
+ngx_http_site_guard_init_zone(ngx_shm_zone_t *shm_zone, void *data)
+{
+    ngx_http_site_guard_zone_ctx_t  *octx = data;
+    ngx_http_site_guard_zone_ctx_t  *ctx = shm_zone->data;
+
+    if (octx != NULL) {
+        ctx->shpool = octx->shpool;
+        ctx->sh = octx->sh;
+        return NGX_OK;
+    }
+
+    ctx->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
+    if (shm_zone->shm.exists) {
+        ctx->sh = ctx->shpool->data;
+        return NGX_OK;
+    }
+
+    ctx->sh = ngx_slab_alloc(ctx->shpool,
+                             sizeof(ngx_http_site_guard_shctx_t));
+    if (ctx->sh == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memzero(ctx->sh, sizeof(ngx_http_site_guard_shctx_t));
+    ctx->shpool->data = ctx->sh;
+    return NGX_OK;
 }
 
 static ngx_int_t
