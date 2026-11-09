@@ -5,6 +5,14 @@
 #define NGX_HTTP_SITE_GUARD_STAT_PATH    3
 #define NGX_HTTP_SITE_GUARD_STAT_KEY_MAX 255
 
+static const ngx_uint_t ngx_http_site_guard_linear_count[65] = {
+    0, 266, 222, 196, 177, 163, 151, 142, 133, 126, 119, 113, 107,
+    102, 97, 93, 89, 85, 81, 78, 74, 71, 68, 65, 63, 60, 58, 55,
+    53, 51, 48, 46, 44, 42, 40, 39, 37, 35, 33, 32, 30, 28, 27, 25,
+    24, 23, 21, 20, 18, 17, 16, 15, 13, 12, 11, 10, 9, 7, 6, 5, 4,
+    3, 2, 1, 0
+};
+
 static uint64_t
 ngx_http_site_guard_hash64(u_char *data, size_t len)
 {
@@ -262,7 +270,7 @@ ngx_http_site_guard_stats_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data, ngx_shm_zone_t *shm_zone)
 {
     double                            estimate, sum;
-    ngx_uint_t                        hash, i, type, value;
+    ngx_uint_t                        hash, i, type, value, zeros;
     ngx_str_t                         key;
     ngx_msec_t                        now;
     ngx_http_site_guard_zone_ctx_t  *zctx;
@@ -289,11 +297,19 @@ ngx_http_site_guard_stats_variable(ngx_http_request_t *r,
     if (sn != NULL && data == 5) {
         if ((ngx_msec_int_t) (now - sn->hll_start) < 300000) {
             sum = 0;
+            zeros = 0;
             for (i = 0; i < NGX_HTTP_SITE_GUARD_STATS_HLL_REGISTERS; i++) {
                 sum += 1.0 / (double) ((uint64_t) 1 << sn->hll[i]);
+                if (sn->hll[i] == 0) {
+                    zeros++;
+                }
             }
             estimate = 0.7213 / (1 + 1.079 / 64) * 64 * 64 / sum;
-            value = (ngx_uint_t) estimate;
+            if (estimate < 160 && zeros != 0) {
+                value = ngx_http_site_guard_linear_count[zeros];
+            } else {
+                value = (ngx_uint_t) estimate;
+            }
         }
     } else if (sn != NULL) {
         for (i = 0; i < NGX_HTTP_SITE_GUARD_STATS_BUCKETS; i++) {

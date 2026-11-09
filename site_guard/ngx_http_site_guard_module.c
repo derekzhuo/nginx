@@ -27,6 +27,11 @@ typedef struct {
     ngx_shm_zone_t *shm_zone;
 } ngx_http_site_guard_loc_conf_t;
 
+typedef struct {
+    ngx_uint_t  status;
+    ngx_flag_t  stats_recorded;
+} ngx_http_site_guard_request_ctx_t;
+
 static ngx_int_t ngx_http_site_guard_handler(ngx_http_request_t *r);
 static ngx_int_t ngx_http_site_guard_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_site_guard_init(ngx_conf_t *cf);
@@ -123,21 +128,31 @@ static ngx_int_t
 ngx_http_site_guard_handler(ngx_http_request_t *r)
 {
     ngx_uint_t                       i;
-    ngx_str_t                       *prefix, *rule, referer;
-    ngx_http_site_guard_loc_conf_t  *lrcf;
+    ngx_str_t                        *prefix, *rule, referer;
+    ngx_http_site_guard_loc_conf_t     *lrcf;
+    ngx_http_site_guard_request_ctx_t  *rctx;
 
     if (r != r->main || !(r->method & (NGX_HTTP_GET|NGX_HTTP_HEAD))) {
         return NGX_DECLINED;
     }
     lrcf = ngx_http_get_module_loc_conf(r, ngx_http_site_guard_module);
+    rctx = ngx_http_get_module_ctx(r, ngx_http_site_guard_module);
+    if (rctx == NULL) {
+        rctx = ngx_pcalloc(r->pool, sizeof(ngx_http_site_guard_request_ctx_t));
+        if (rctx == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        ngx_http_set_ctx(r, rctx, ngx_http_site_guard_module);
+    }
+
     if (!lrcf->enabled) {
-        ngx_http_set_ctx(r, (void *) NGX_HTTP_SITE_GUARD_DISABLED,
-                         ngx_http_site_guard_module);
+        rctx->status = NGX_HTTP_SITE_GUARD_DISABLED;
         return NGX_DECLINED;
     }
-    ngx_http_set_ctx(r, (void *) NGX_HTTP_SITE_GUARD_PASSED,
-                     ngx_http_site_guard_module);
-    ngx_http_site_guard_stats_record(r, lrcf->shm_zone);
+    if (!rctx->stats_recorded) {
+        ngx_http_site_guard_stats_record(r, lrcf->shm_zone);
+        rctx->stats_recorded = 1;
+    }
     if (r->headers_in.referer == NULL) {
         return NGX_DECLINED;
     }
@@ -193,11 +208,9 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
 
 matched:
 
-    ngx_http_set_ctx(r,
-                     lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
-                     ? (void *) NGX_HTTP_SITE_GUARD_MATCHED
-                     : (void *) NGX_HTTP_SITE_GUARD_DRY_RUN,
-                     ngx_http_site_guard_module);
+    rctx->status = lrcf->mode == NGX_HTTP_SITE_GUARD_ENFORCE
+                   ? NGX_HTTP_SITE_GUARD_MATCHED
+                   : NGX_HTTP_SITE_GUARD_DRY_RUN;
     ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
                   "site_guard matched uri=\"%V\" referer=\"%V\"%s",
                   &r->uri, &referer,
@@ -265,8 +278,12 @@ ngx_http_site_guard_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    status = (uintptr_t) ngx_http_get_module_ctx(r->main,
-                                                 ngx_http_site_guard_module);
+    {
+        ngx_http_site_guard_request_ctx_t  *rctx;
+
+        rctx = ngx_http_get_module_ctx(r->main, ngx_http_site_guard_module);
+        status = rctx == NULL ? NGX_HTTP_SITE_GUARD_PASSED : rctx->status;
+    }
     if (status > NGX_HTTP_SITE_GUARD_DISABLED) {
         status = NGX_HTTP_SITE_GUARD_PASSED;
     }
