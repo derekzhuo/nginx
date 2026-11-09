@@ -5,6 +5,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include "ngx_http_site_guard_stats.h"
 
 #define NGX_HTTP_SITE_GUARD_PASSED   0
 #define NGX_HTTP_SITE_GUARD_MATCHED  1
@@ -12,31 +13,9 @@
 #define NGX_HTTP_SITE_GUARD_DISABLED 3
 #define NGX_HTTP_SITE_GUARD_SHADOW   0
 #define NGX_HTTP_SITE_GUARD_ENFORCE  1
-#define NGX_HTTP_SITE_GUARD_MAX_RULES 64
 #define NGX_HTTP_SITE_GUARD_MAX_RULE_LEN 2048
 #define NGX_HTTP_SITE_GUARD_MAX_FILE 131072
 #define NGX_HTTP_SITE_GUARD_REFRESH 1000
-
-typedef struct {
-    size_t      len;
-    u_char     *data;
-} ngx_http_site_guard_shrule_t;
-
-typedef struct {
-    ngx_uint_t                     generation;
-    ngx_uint_t                     count;
-    ngx_uint_t                     loading;
-    ngx_msec_t                     last_check;
-    time_t                         mtime;
-    off_t                          size;
-    ngx_file_uniq_t                uniq;
-    ngx_http_site_guard_shrule_t   rules[NGX_HTTP_SITE_GUARD_MAX_RULES];
-} ngx_http_site_guard_shctx_t;
-
-typedef struct {
-    ngx_slab_pool_t                *shpool;
-    ngx_http_site_guard_shctx_t    *sh;
-} ngx_http_site_guard_zone_ctx_t;
 
 typedef struct {
     ngx_flag_t    enabled;
@@ -124,6 +103,14 @@ static ngx_http_variable_t ngx_http_site_guard_vars[] = {
       0, NGX_HTTP_VAR_NOCACHEABLE, 0 },
     { ngx_string("site_guard_generation"), NULL, ngx_http_site_guard_variable,
       1, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_referer_qpm"), NULL, ngx_http_site_guard_variable,
+      2, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_ua_qpm"), NULL, ngx_http_site_guard_variable,
+      3, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_path_qpm"), NULL, ngx_http_site_guard_variable,
+      4, NGX_HTTP_VAR_NOCACHEABLE, 0 },
+    { ngx_string("site_guard_referer_ips"), NULL, ngx_http_site_guard_variable,
+      5, NGX_HTTP_VAR_NOCACHEABLE, 0 },
       ngx_http_null_variable
 };
 
@@ -150,6 +137,7 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
     }
     ngx_http_set_ctx(r, (void *) NGX_HTTP_SITE_GUARD_PASSED,
                      ngx_http_site_guard_module);
+    ngx_http_site_guard_stats_record(r, lrcf->shm_zone);
     if (r->headers_in.referer == NULL) {
         return NGX_DECLINED;
     }
@@ -244,6 +232,13 @@ ngx_http_site_guard_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     uintptr_t  status;
+
+    if (data >= 2) {
+        ngx_http_site_guard_loc_conf_t  *lrcf;
+
+        lrcf = ngx_http_get_module_loc_conf(r, ngx_http_site_guard_module);
+        return ngx_http_site_guard_stats_variable(r, v, data, lrcf->shm_zone);
+    }
 
     if (data == 1) {
         ngx_uint_t                       generation;
@@ -606,6 +601,7 @@ ngx_http_site_guard_init_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_ERROR;
     }
     ngx_memzero(ctx->sh, sizeof(ngx_http_site_guard_shctx_t));
+    ngx_http_site_guard_stats_init(ctx->sh);
     ctx->shpool->data = ctx->sh;
     return NGX_OK;
 }
