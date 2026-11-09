@@ -259,7 +259,7 @@ ngx_http_site_guard_variable(ngx_http_request_t *r,
             ngx_shmtx_unlock(&zctx->shpool->mutex);
         }
 
-        v->data = ngx_pnalloc(r->pool, NGX_UINT_T_LEN);
+        v->data = ngx_pnalloc(r->pool, NGX_SIZE_T_LEN);
         if (v->data == NULL) {
             return NGX_ERROR;
         }
