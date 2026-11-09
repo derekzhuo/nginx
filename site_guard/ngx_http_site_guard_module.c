@@ -115,7 +115,7 @@ static ngx_http_variable_t ngx_http_site_guard_vars[] = {
       4, NGX_HTTP_VAR_NOCACHEABLE, 0 },
     { ngx_string("site_guard_referer_ips"), NULL, ngx_http_site_guard_variable,
       5, NGX_HTTP_VAR_NOCACHEABLE, 0 },
-    { ngx_string("site_guard_once"), NULL, NULL, 0,
+    { ngx_string("site_guard_once"), NULL, ngx_http_site_guard_variable, 6,
       NGX_HTTP_VAR_CHANGEABLE|NGX_HTTP_VAR_NOCACHEABLE, 0 },
       ngx_http_null_variable
 };
@@ -255,6 +255,15 @@ ngx_http_site_guard_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
 {
     uintptr_t  status;
+
+    if (data == 6) {
+        v->valid = 0;
+        v->no_cacheable = 1;
+        v->not_found = 1;
+        v->len = 0;
+        v->data = NULL;
+        return NGX_OK;
+    }
 
     if (data >= 2) {
         ngx_http_site_guard_loc_conf_t  *lrcf;
