@@ -48,7 +48,9 @@ static ngx_int_t ngx_http_site_guard_init_zone(ngx_shm_zone_t *shm_zone,
 static ngx_int_t ngx_http_site_guard_refresh(ngx_http_request_t *r,
     ngx_http_site_guard_loc_conf_t *lrcf);
 static ngx_uint_t ngx_http_site_guard_match(ngx_str_t *rule,
-    ngx_str_t *referer);
+    ngx_str_t *referer, ngx_str_t *referer_path);
+static ngx_int_t ngx_http_site_guard_normalize(ngx_pool_t *pool,
+    ngx_str_t *input, ngx_str_t *canonical, ngx_str_t *path_part);
 
 static ngx_conf_enum_t ngx_http_site_guard_modes[] = {
     { ngx_string("shadow"), NGX_HTTP_SITE_GUARD_SHADOW },
@@ -179,37 +181,50 @@ ngx_http_site_guard_handler(ngx_http_request_t *r)
     }
     referer = r->headers_in.referer->value;
 
-    if (lrcf->shm_zone != NULL && lrcf->rules_file.len != 0) {
-        ngx_http_site_guard_zone_ctx_t  *zctx;
-        ngx_uint_t                       matched;
+    {
+        ngx_str_t  ref_canon, ref_path;
 
-        (void) ngx_http_site_guard_refresh(r, lrcf);
-        zctx = lrcf->shm_zone->data;
-        matched = 0;
+        if (ngx_http_site_guard_normalize(r->pool, &referer,
+                                          &ref_canon, &ref_path)
+            != NGX_OK)
+        {
+            return NGX_DECLINED;
+        }
 
-        ngx_shmtx_lock(&zctx->shpool->mutex);
-        for (i = 0; i < zctx->sh->count; i++) {
-            ngx_str_t  rule;
+        if (lrcf->shm_zone != NULL && lrcf->rules_file.len != 0) {
+            ngx_http_site_guard_zone_ctx_t  *zctx;
+            ngx_uint_t                       matched;
 
-            rule.len = zctx->sh->rules[i].len;
-            rule.data = zctx->sh->rules[i].data;
-            if (ngx_http_site_guard_match(&rule, &referer)) {
-                matched = 1;
-                break;
+            (void) ngx_http_site_guard_refresh(r, lrcf);
+            zctx = lrcf->shm_zone->data;
+            matched = 0;
+
+            ngx_shmtx_lock(&zctx->shpool->mutex);
+            for (i = 0; i < zctx->sh->count; i++) {
+                ngx_str_t  rrule;
+
+                rrule.len = zctx->sh->rules[i].len;
+                rrule.data = zctx->sh->rules[i].data;
+                if (ngx_http_site_guard_match(&rrule, &ref_canon, &ref_path)) {
+                    matched = 1;
+                    break;
+                }
+            }
+            ngx_shmtx_unlock(&zctx->shpool->mutex);
+
+            if (matched) {
+                goto matched;
             }
         }
-        ngx_shmtx_unlock(&zctx->shpool->mutex);
 
-        if (matched) {
-            goto matched;
-        }
-    }
-
-    if (lrcf->referers != NULL) {
-        rule = lrcf->referers->elts;
-        for (i = 0; i < lrcf->referers->nelts; i++) {
-            if (ngx_http_site_guard_match(&rule[i], &referer)) {
-                goto matched;
+        if (lrcf->referers != NULL) {
+            rule = lrcf->referers->elts;
+            for (i = 0; i < lrcf->referers->nelts; i++) {
+                if (ngx_http_site_guard_match(&rule[i], &ref_canon,
+                                              &ref_path))
+                {
+                    goto matched;
+                }
             }
         }
     }
@@ -232,22 +247,178 @@ matched:
     return NGX_DECLINED;
 }
 
-static ngx_uint_t
-ngx_http_site_guard_match(ngx_str_t *rule, ngx_str_t *referer)
+/*
+ * Canonicalize a rule or Referer value once, so matching is a byte compare.
+ * Full-URL form: lowercased scheme and host, default port (https:443,
+ * http:80) dropped, query/fragment removed, repeated trailing slashes
+ * trimmed. Path-only form (begins with '/'): same path treatment.
+ * Malformed input returns NGX_DECLINED; path_part points inside canonical at
+ * the path for path-only rules.
+ */
+static ngx_int_t
+ngx_http_site_guard_normalize(ngx_pool_t *pool, ngx_str_t *input,
+    ngx_str_t *canonical, ngx_str_t *path_part)
 {
-    size_t  rule_len, referer_len;
+    u_char  *p, *scheme_end = NULL, *rest, *auth_end, *host = NULL, *path,
+            *out, *port = NULL;
+    size_t   len, scheme_len = 0, host_len = 0, path_len, port_len = 0,
+             copy_len;
+    ngx_str_t scheme;
 
-    rule_len = rule->len;
-    referer_len = referer->len;
-    if (rule_len > 1 && rule->data[rule_len - 1] == '/') {
-        rule_len--;
-    }
-    if (referer_len > 1 && referer->data[referer_len - 1] == '/') {
-        referer_len--;
+    if (input->len == 0) {
+        return NGX_DECLINED;
     }
 
-    return rule_len == referer_len
-           && ngx_strncmp(rule->data, referer->data, rule_len) == 0;
+    p = ngx_strnstr(input->data, "://", input->len);
+
+    if (p == NULL) {
+        if (input->data[0] != '/') {
+            return NGX_DECLINED;
+        }
+
+        path = input->data;
+        path_len = input->len;
+        goto path_only;
+    }
+
+    scheme_end = p;
+    scheme.data = input->data;
+    scheme_len = scheme_end - input->data;
+
+    if (scheme_len == 0 || scheme_len > 16) {
+        return NGX_DECLINED;
+    }
+
+    rest = scheme_end + 3;
+    len = input->len - (size_t) (rest - input->data);
+    if (len == 0) {
+        return NGX_DECLINED;
+    }
+
+    auth_end = rest;
+    while (auth_end < input->data + input->len
+           && *auth_end != '/' && *auth_end != '?' && *auth_end != '#')
+    {
+        auth_end++;
+    }
+
+    if (auth_end == rest) {
+        return NGX_DECLINED;
+    }
+
+    host = rest;
+    host_len = (size_t) (auth_end - rest);
+    port = NULL;
+    port_len = 0;
+
+    if (host[0] == '[') {
+        p = ngx_strlchr(host, auth_end, ']');
+        if (p == NULL) {
+            return NGX_DECLINED;
+        }
+        if (p + 1 < auth_end && *(p + 1) == ':') {
+            port = p + 2;
+            port_len = (size_t) (auth_end - port);
+            host_len = (size_t) (p + 1 - host);
+        }
+    } else {
+        p = ngx_strlchr(host, auth_end, ':');
+        if (p != NULL) {
+            port = p + 1;
+            port_len = (size_t) (auth_end - port);
+            host_len = (size_t) (p - host);
+            if (host_len == 0 || port_len == 0) {
+                return NGX_DECLINED;
+            }
+        }
+    }
+
+    if (port_len != 0) {
+        if ((scheme_len == 5
+             && ngx_strncasecmp(scheme.data, (u_char *) "https", 5) == 0
+             && port_len == 3 && ngx_strncmp(port, "443", 3) == 0)
+            || (scheme_len == 4
+                && ngx_strncasecmp(scheme.data, (u_char *) "http", 4) == 0
+                && port_len == 2 && ngx_strncmp(port, "80", 2) == 0))
+        {
+            port_len = 0;
+        }
+    }
+
+    path = auth_end;
+    path_len = (size_t) (input->data + input->len - auth_end);
+    if (path_len == 0 || path[0] != '/') {
+        path = (u_char *) "/";
+        path_len = 1;
+    }
+
+path_only:
+
+    p = path;
+    while (p < path + path_len && *p != '?' && *p != '#') {
+        p++;
+    }
+    path_len = (size_t) (p - path);
+
+    while (path_len > 1 && path[path_len - 1] == '/') {
+        path_len--;
+    }
+
+    if (scheme_end == NULL) {
+        out = ngx_palloc(pool, path_len);
+        if (out == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(out, path, path_len);
+        canonical->data = out;
+        canonical->len = path_len;
+        path_part->data = out;
+        path_part->len = path_len;
+        return NGX_OK;
+    }
+
+    copy_len = scheme_len + 3 + host_len + (port_len ? port_len + 1 : 0)
+               + path_len;
+    out = ngx_palloc(pool, copy_len);
+    if (out == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = out;
+    ngx_memcpy(p, scheme.data, scheme_len);
+    ngx_strlow(p, p, scheme_len);
+    p += scheme_len;
+    ngx_memcpy(p, "://", 3);
+    p += 3;
+    ngx_memcpy(p, host, host_len);
+    ngx_strlow(p, p, host_len);
+    p += host_len;
+    if (port_len) {
+        *p++ = ':';
+        ngx_memcpy(p, port, port_len);
+        p += port_len;
+    }
+    ngx_memcpy(p, path, path_len);
+
+    canonical->data = out;
+    canonical->len = copy_len;
+    path_part->data = p;
+    path_part->len = path_len;
+    return NGX_OK;
+}
+
+static ngx_uint_t
+ngx_http_site_guard_match(ngx_str_t *rule, ngx_str_t *referer,
+    ngx_str_t *referer_path)
+{
+    /* Path-only rules compare against the path part of the Referer. */
+    if (rule->len > 0 && rule->data[0] == '/') {
+        return rule->len == referer_path->len
+               && ngx_strncmp(rule->data, referer_path->data, rule->len) == 0;
+    }
+
+    return rule->len == referer->len
+           && ngx_strncmp(rule->data, referer->data, rule->len) == 0;
 }
 
 static ngx_int_t
@@ -334,6 +505,7 @@ ngx_http_site_guard_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
     ngx_http_site_guard_loc_conf_t  *prev = parent;
     ngx_http_site_guard_loc_conf_t  *conf = child;
+    ngx_uint_t                       i;
 
     ngx_conf_merge_value(conf->enabled, prev->enabled, 0);
     ngx_conf_merge_uint_value(conf->mode, prev->mode,
@@ -346,6 +518,32 @@ ngx_http_site_guard_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
     if (conf->referers == NULL) {
         conf->referers = prev->referers;
+    } else {
+        ngx_array_t  *norm;
+        ngx_str_t    *items, *item, canonical, cpath;
+
+        items = conf->referers->elts;
+        norm = ngx_array_create(cf->pool, conf->referers->nelts,
+                                sizeof(ngx_str_t));
+        if (norm == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        for (i = 0; i < conf->referers->nelts; i++) {
+            if (ngx_http_site_guard_normalize(cf->pool, &items[i],
+                                              &canonical, &cpath) != NGX_OK)
+            {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "site_guard_referer has invalid value "
+                                   "\"%V\"", &items[i]);
+                return NGX_CONF_ERROR;
+            }
+            item = ngx_array_push(norm);
+            if (item == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *item = canonical;
+        }
+        conf->referers = norm;
     }
     if (conf->excluded_prefixes == NULL) {
         conf->excluded_prefixes = prev->excluded_prefixes;
@@ -524,6 +722,23 @@ ngx_http_site_guard_refresh(ngx_http_request_t *r,
         parsed[count].data = start;
         parsed[count].len = stop - start;
         count++;
+    }
+
+    for (i = 0; i < count; i++) {
+        ngx_str_t  raw, canonical, cpath;
+
+        raw.len = parsed[i].len;
+        raw.data = parsed[i].data;
+        if (ngx_http_site_guard_normalize(r->pool, &raw,
+                                          &canonical, &cpath) != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "site_guard invalid rule \"%V\" in \"%V\"",
+                          &raw, &lrcf->rules_file);
+            goto failed;
+        }
+        parsed[i].len = canonical.len;
+        parsed[i].data = canonical.data;
     }
 
     ngx_shmtx_lock(&zctx->shpool->mutex);

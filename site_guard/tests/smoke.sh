@@ -96,6 +96,44 @@ assert_status "spoof host suffix passes" "$PASS_THROUGH" \
   -e https://example.com/nn/beginner/nn-b-01.evil.test "http://127.0.0.1:$PORT/chip-design/"
 assert_status "HEAD blocked with same policy" 000 \
   -I -e https://example.com/nn/beginner/nn-b-01 "http://127.0.0.1:$PORT/chip-design/"
+assert_status "malformed Referer passes" "$PASS_THROUGH" \
+  -e "not-a-url" "http://127.0.0.1:$PORT/chip-design/"
+
+# CRUD control plane plus request normalization. The module polls the rule
+# file once per second, so each publish is followed by a short wait.
+RULES="$PREFIX/data/referers.rules"
+CTL="${SITE_GUARD_CTL:-$PWD/site_guard/tests/site-guard-ctl}"
+"$CTL" "$RULES" validate
+
+"$CTL" "$RULES" add "https://example.com/nn/beginner/nn-b-03"
+sleep 1.2
+assert_status "uppercase scheme/host plus query normalized and blocked" 000 \
+  -e "HTTPS://EXAMPLE.COM/nn/beginner/nn-b-03?utm=z" "http://127.0.0.1:$PORT/chip-design/x"
+assert_status "default port and trailing slash normalized and blocked" 000 \
+  -e "https://example.com:443/nn/beginner/nn-b-03/" "http://127.0.0.1:$PORT/eda/x"
+assert_status "non-default port does not match canonical rule" "$PASS_THROUGH" \
+  -e "https://example.com:8443/nn/beginner/nn-b-03" "http://127.0.0.1:$PORT/chip-design/x"
+
+"$CTL" "$RULES" add "/nn/beginner/nn-b-04"
+sleep 1.2
+assert_status "path-only rule blocks across hosts" 000 \
+  -e "http://other.host/nn/beginner/nn-b-04" "http://127.0.0.1:$PORT/fpga/x"
+
+if "$CTL" "$RULES" add "not-a-url" >/dev/null 2>&1; then
+  echo "FAIL ctl accepted an invalid rule" >&2; fail=1
+else
+  echo "PASS ctl rejected invalid rule"
+fi
+"$CTL" "$RULES" validate
+assert_status "rejected rule never loaded" "$PASS_THROUGH" \
+  -e "not-a-url" "http://127.0.0.1:$PORT/chip-design/x"
+
+"$CTL" "$RULES" remove "https://example.com/nn/beginner/nn-b-03"
+sleep 1.2
+assert_status "removed rule no longer blocks" "$PASS_THROUGH" \
+  -e "https://example.com/nn/beginner/nn-b-03" "http://127.0.0.1:$PORT/chip-design/x"
+assert_status "remaining path-only rule still blocks" 000 \
+  -e "http://other.host/nn/beginner/nn-b-04" "http://127.0.0.1:$PORT/fpga/x"
 
 # Stats variables must be populated in the guard log after matched traffic.
 curl -s -o /dev/null -e https://example.com/nn/beginner/nn-b-01 "http://127.0.0.1:$PORT/chip-design/x" || true

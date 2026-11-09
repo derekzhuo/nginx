@@ -1,0 +1,133 @@
+#!/bin/sh
+# Local CRUD control plane for site_guard rule files.
+# The nginx module loads one full Referer (or absolute path) per line with
+# atomic rename publication; this tool enforces the same limits the module
+# enforces (64 rules, 128 KiB file, 2048 bytes per rule) and writes through a
+# temporary file plus mv so a reader never observes a partial rule set.
+set -eu
+
+MAX_RULES=64
+MAX_FILE=131072
+MAX_RULE_LEN=2048
+
+usage() {
+    cat <<'USAGE' >&2
+Usage: site-guard-ctl <rules-file> <command> [args]
+  list                       Show numbered rules
+  validate                   Check every line and the file limits
+  add <rule> [rule ...]      Append rules (dedup, atomic publish)
+  remove <rule> [rule ...]   Delete exact rules (atomic publish)
+  clear                      Publish an empty rule file
+A rule is an absolute path ("/nn/beginner/x") or an http(s) URL without
+query, fragment, or whitespace. Exit 0 on success, 1 on validation error,
+2 on usage or I/O error.
+USAGE
+    exit 2
+}
+
+die() {
+    echo "site-guard-ctl: $*" >&2
+    exit 1
+}
+
+[ "$#" -ge 2 ] || usage
+FILE=$1
+CMD=$2
+shift 2
+
+validate_rule() {
+    rule=$1
+    [ -n "$rule" ] || die "empty rule"
+    [ "${#rule}" -le "$MAX_RULE_LEN" ] || die "rule longer than $MAX_RULE_LEN bytes: $rule"
+    if printf '%s' "$rule" | grep -qE '([[:space:]]|[?#])'; then
+        die "rule contains whitespace, query, or fragment: $rule"
+    fi
+    case "$rule" in
+        http://*|https://*)
+            host=${rule#*://}
+            [ -n "$host" ] || die "URL missing host: $rule"
+            ;;
+        /*)
+            ;;
+        *)
+            die "rule must be an http(s) URL or an absolute path: $rule"
+            ;;
+    esac
+}
+
+check_file_limits() {
+    lines=$(grep -cvE '^[[:space:]]*(#|$)' "$1" || true)
+    lines=$(printf '%s' "$lines" | grep -oE '[0-9]+' || true)
+    [ "${lines:-0}" -le "$MAX_RULES" ] || die "rule count $lines exceeds $MAX_RULES"
+    size=$(wc -c < "$1" | tr -d ' ')
+    [ "$size" -le "$MAX_FILE" ] || die "file size $size exceeds $MAX_FILE bytes"
+}
+
+publish() {
+    dir=$(dirname "$FILE")
+    [ -d "$dir" ] || die "directory not found: $dir"
+    tmp=$(mktemp "$dir/.rules.XXXXXX")
+    cat > "$tmp"
+    mv "$tmp" "$FILE"
+}
+
+case "$CMD" in
+    list)
+        [ -f "$FILE" ] || exit 0
+        grep -vE '^[[:space:]]*($|#)' "$FILE" | nl -ba
+        ;;
+
+    validate)
+        [ -f "$FILE" ] || die "rule file not found: $FILE"
+        while IFS= read -r line; do
+            case "$line" in
+                ''|'#'*|[[:space:]]*) continue ;;
+            esac
+            validate_rule "$line"
+        done < "$FILE"
+        check_file_limits "$FILE"
+        echo "OK: $lines rules, $(wc -c < "$FILE" | tr -d ' ') bytes"
+        ;;
+
+    add)
+        [ "$#" -ge 1 ] || usage
+        for rule in "$@"; do
+            validate_rule "$rule"
+        done
+        tmp_present=0
+        [ -f "$FILE" ] && tmp_present=1
+        {
+            [ "$tmp_present" -eq 1 ] && cat "$FILE"
+            for rule in "$@"; do
+                if [ "$tmp_present" -eq 1 ] && grep -Fqx "$rule" "$FILE"; then
+                    continue
+                fi
+                printf '%s\n' "$rule"
+            done
+        } | publish
+        check_file_limits "$FILE"
+        ;;
+
+    remove)
+        [ "$#" -ge 1 ] || usage
+        [ -f "$FILE" ] || die "rule file not found: $FILE"
+        for rule in "$@"; do
+            validate_rule "$rule"
+            grep -Fqx "$rule" "$FILE" || die "rule not present: $rule"
+        done
+        pattern_file=$(mktemp "${TMPDIR:-/tmp}/.rules-pattern.XXXXXX")
+        for rule in "$@"; do
+            printf '%s\n' "$rule"
+        done > "$pattern_file"
+        grep -Fvxf "$pattern_file" "$FILE" | publish || true
+        rm -f "$pattern_file"
+        ;;
+
+    clear)
+        : | publish
+        ;;
+
+    *)
+        usage
+        ;;
+esac
